@@ -52,7 +52,7 @@ From the repository root:
 
 ````bash
 python3 [main.py](http://_vscodecontentref_/0)
-```
+````
 
 A plot window will open showing:
 
