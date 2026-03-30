@@ -68,11 +68,34 @@ class ObstacleJacobians:
 
 
 class OptimizationBasedCar:
-    def __init__(self, L=2.5, dt=0.1):
+    def __init__(self, L=2.5, dt=0.2):
         self.L, self.dt = L, dt
         self.obs =[]
         self.buffer = 0.5
         self.obs_jac = ObstacleJacobians(buffer=self.buffer)
+        
+        # --- NEW: Define physical limits ---
+        self.v_bounds = [-5.0, 5.0]
+        self.delta_bounds = [-0.3, 0.3]
+
+    def project_controls(self, u_req):
+        """ Projects requested controls to physical limits and returns the IFT gradient. """
+        v_req, delta_req = u_req
+        
+        # 1. Project to limits
+        v_app = np.clip(v_req, self.v_bounds[0], self.v_bounds[1])
+        delta_app = np.clip(delta_req, self.delta_bounds[0], self.delta_bounds[1])
+        u_applied = np.array([v_app, delta_app])
+        
+        # 2. Compute Jacobian (du_applied / du_req)
+        # We use a small leaky gradient (0.01) instead of 0 to ensure the optimizer
+        # still gets a tiny signal to adjust controls when saturated.
+        dv = 1.0 if self.v_bounds[0] <= v_req <= self.v_bounds[1] else 0.01
+        ddelta = 1.0 if self.delta_bounds[0] <= delta_req <= self.delta_bounds[1] else 0.01
+        
+        du_app_du_req = np.diag([dv, ddelta])
+        
+        return u_applied, du_app_du_req
 
     def _circle_constraint(self, z, obs):
         vals, _ = self.obs_jac.circle_constraints(z, [obs])
@@ -109,13 +132,17 @@ class OptimizationBasedCar:
             theta + (v / self.L) * np.tan(delta) * self.dt
         ])
     
-    def lower_level_physics(self, x_t, u_t):
-        x_nom = self.kinematics(x_t, u_t)
+    def lower_level_physics(self, x_t, u_req):
+        # 1. Apply physical limits
+        u_applied, _ = self.project_controls(u_req)
+        
+        # 2. Run kinematics using the CLIPPED/APPLIED controls
+        x_nom = self.kinematics(x_t, u_applied)
 
         def obj(z): return 0.5 * np.sum((z - x_nom) ** 2)
         def obj_jac(z): return z - x_nom
 
-        constraints = []
+        constraints =[]
         for o in self.obs:
             if o['type'] == 'circle':
                 constraints.append({'type': 'ineq', 'fun': lambda z, o=o: self._circle_constraint(z, o), 'jac': lambda z, o=o: self._circle_constraint_jac(z, o)})
@@ -125,18 +152,30 @@ class OptimizationBasedCar:
         res = minimize(obj, x_nom, jac=obj_jac, method='SLSQP', constraints=constraints, tol=1e-6)
         return res.x, res
 
-    def get_kinematics_jacobians(self, x, u):
+
+    def get_kinematics_jacobians(self, x, u_req):
         _, _, theta = x
-        v, delta = u
         dt, L = self.dt, self.L
+        
+        # Get physical controls and the projection gradient
+        u_applied, du_app_du_req = self.project_controls(u_req)
+        v, delta = u_applied
+        
+        # State Jacobian (fx)
         fx = np.eye(3)
         fx[0, 2] = -v * np.sin(theta) * dt
         fx[1, 2] =  v * np.cos(theta) * dt
-        fu = np.zeros((3, 2))
-        fu[0, 0] = np.cos(theta) * dt
-        fu[1, 0] = np.sin(theta) * dt
-        fu[2, 0] = (1/L) * np.tan(delta) * dt
-        fu[2, 1] = (v/L) * (1 / np.cos(delta)**2) * dt
+        
+        # Control Jacobian w.r.t APPLIED control
+        fu_applied = np.zeros((3, 2))
+        fu_applied[0, 0] = np.cos(theta) * dt
+        fu_applied[1, 0] = np.sin(theta) * dt
+        fu_applied[2, 0] = (1/L) * np.tan(delta) * dt
+        fu_applied[2, 1] = (v/L) * (1 / np.cos(delta)**2) * dt
+        
+        # Chain rule: df/du_req = df/du_applied * du_applied/du_req
+        fu = fu_applied @ du_app_du_req
+        
         return fx, fu
     
     def get_ift_gradients(self, x_t, u_t, z_opt, res, active_tol=1e-4):
@@ -282,8 +321,8 @@ class ILQRPlanner:
                 u_t = u_t + alpha * k[t] + K[t] @ dx
 
             # SAFETY LIMITS: Avoid blowing up the tan() kinematics
-            u_t[0] = np.clip(u_t[0], -5.0, 5.0)  
-            u_t[1] = np.clip(u_t[1], -1.2, 1.2)  
+            # u_t[0] = np.clip(u_t[0], -5.0, 5.0)  
+            # u_t[1] = np.clip(u_t[1], -1.2, 1.2)  
             u_applied.append(u_t)
 
             x_next, res = self.car.lower_level_physics(states[-1], u_t)
@@ -318,7 +357,7 @@ if __name__ == "__main__":
     goal_pose  = np.array([10.0, 5.0, 0.0])
     weights = {'Q': np.diag([10, 10, 0.5]), 
                'R': np.diag([0.1, 0.1]),
-               'Qf': np.diag([8000, 8000, 200])}
+               'Qf': np.diag([800, 800, 20])}
 
     planner = ILQRPlanner(car, horizon=30)
     planned_traj, u_nom, K_seq, init_traj = planner.solve(start_pose, goal_pose, weights)
@@ -331,8 +370,8 @@ if __name__ == "__main__":
         
         u_feedback = u_nom[t] + K_seq[t] @ error
         # Constrain feedback to prevent noise from inducing singularity
-        u_feedback[0] = np.clip(u_feedback[0], -5.0, 5.0)
-        u_feedback[1] = np.clip(u_feedback[1], -1.2, 1.2)
+        # u_feedback[0] = np.clip(u_feedback[0], -5.0, 5.0)
+        # u_feedback[1] = np.clip(u_feedback[1], -1.2, 1.2)
         
         x_next, _ = car.lower_level_physics(x_curr, u_feedback)
         x_curr = x_next + np.random.normal(0, 0.04, 3) 
