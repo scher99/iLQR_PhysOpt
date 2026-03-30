@@ -45,7 +45,7 @@ Install the Python dependencies:
 
 ````bash
 pip install numpy scipy matplotlib
-
+````
 ## Run
 
 From the repository root:
