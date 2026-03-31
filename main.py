@@ -3,6 +3,21 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
+# This code implements a two-level optimization framework for trajectory planning of a 
+# car-like robot in an environment with obstacles. The upper level uses an iterative Linear 
+# Quadratic Regulator (iLQR) to optimize the trajectory towards a goal, while the lower level 
+# simulates the physics of the car and enforces obstacle constraints using the Implicit 
+# Function Theorem (IFT) to provide gradients back to the upper level.
+# * The Upper Level (iLQR): Only cares about reaching the goal efficiently (minimizing cost). 
+#   It doesn't know about obstacles or limits directly.
+# * The Lower Level (Physics): Only cares about applying the controls, moving the car, 
+#   and strictly enforcing the laws of physics (no crashing, no exceeding max 
+#   steering/velocity).
+# * The Bridge (IFT - Implicit Function Theorem): The Lower Level uses IFT to pass 
+#   "gradients" back up to the Upper Level, saying: "If you steer this way, I will hit a
+#    wall and bounce, which means you won't reach your goal."
+
+
 class ObstacleJacobians:
     def __init__(self, buffer=0.2):
         self.buffer = buffer
@@ -21,7 +36,7 @@ class ObstacleJacobians:
                 else:
                     jacobians.append([0.0, 0.0, 0.0])
         
-        # FIX: Ensure empty lists return the correct 2D shape for numpy vstack
+        # Ensure empty lists return the correct 2D shape for numpy vstack
         if not jacobians:
             return np.array([]), np.zeros((0, 3))
             
@@ -60,7 +75,7 @@ class ObstacleJacobians:
                     else:
                         jacobians.append([0.0, 0.0, 0.0])
                         
-        # FIX: Ensure empty lists return the correct 2D shape for numpy vstack
+        # Ensure empty lists return the correct 2D shape for numpy vstack
         if not jacobians:
             return np.array([]), np.zeros((0, 3))
             
@@ -74,9 +89,9 @@ class OptimizationBasedCar:
         self.buffer = 0.5
         self.obs_jac = ObstacleJacobians(buffer=self.buffer)
         
-        # --- NEW: Define physical limits ---
+        # --- Define physical limits ---
         self.v_bounds = [-5.0, 5.0]
-        self.delta_bounds = [-0.3, 0.3]
+        self.delta_bounds = [-0.4, 0.4]
 
     def project_controls(self, u_req):
         """ Projects requested controls to physical limits and returns the IFT gradient. """
@@ -132,6 +147,14 @@ class OptimizationBasedCar:
             theta + (v / self.L) * np.tan(delta) * self.dt
         ])
     
+    # Normally, car kinematics are simple explicit equations: x(t+1) = f(x_t, u_t)
+    # But what if the car is about to hit a wall? In this function, the next state is 
+    # formulated as an optimization problem itself:
+    # x(t+1) = argmin_z 0.5 * ||z - x_nom||^2 subject to c(z) ≥ 0
+    # Here, x_nom is where the car wants to go based on basic kinematics. 
+    # The optimizer (scipy.optimize.minimize) finds the closest possible point z
+    # that doesn't violate the obstacle constraints c(z) ≥ 0. 
+    # The Lower-Level Physics & Constraints
     def lower_level_physics(self, x_t, u_req):
         # 1. Apply physical limits
         u_applied, _ = self.project_controls(u_req)
@@ -178,6 +201,9 @@ class OptimizationBasedCar:
         
         return fx, fu
     
+    # x(t+1) is the output of the optimization, we can't just take a simple derivative to
+    # get A=dx(t+1)/dx_t and B=dx(t+1)/du_t (what iLQR needs).
+    # We must differentiate through the optimal solution using the KKT (Karush-Kuhn-Tucker) conditions (Equations 3 & 4 in the paper).
     def get_ift_gradients(self, x_t, u_t, z_opt, res, active_tol=1e-4):
         fx, fu = self.get_kinematics_jacobians(x_t, u_t)
         c_vals, G = self.get_all_obstacle_data(z_opt)
@@ -186,9 +212,9 @@ class OptimizationBasedCar:
         active = np.where(c_vals < active_tol)[0]
         if active.size == 0: return fx, fu
 
-        G_a = G[active]
+        G_a = G[active] #the Jacobian of the active constraints (the direction pointing away from the obstacle).
         m = G_a.shape[0]
-        H = np.eye(3)
+        H = np.eye(3) # the identity matrix because our cost is 0.5 * ||z - x_nom||^2
 
         KKT = np.block([
             [H,      -G_a.T],
@@ -196,6 +222,12 @@ class OptimizationBasedCar:
             # the gradients don't strictly vanish when the car penetrates an obstacle.
             [G_a, np.eye(m) * 1e-5] 
         ])
+        # the bottom right block of KKT should be all zeros. However, if it's strictly zero,
+        # the gradient perpendicular to a wall becomes 0 (strict projection). Adding 
+        # 1e-5 acts like the "log barrier" mentioned in the paper. It makes the 
+        # wall slightly "spongy", giving iLQR a smooth gradient telling it to steer around
+        # the obstacle rather than just scraping against it.
+
         rhs = np.vstack([np.eye(3), np.zeros((m, 3))])
 
         try:
@@ -248,6 +280,7 @@ class ILQRPlanner:
         u[turn_steps:, 0] = v_guess
         return u
         
+    # It calculates k (feedforward adjustment) and K (feedback matrix)
     def solve(self, x0, x_goal, weights):
         u = self._initialize_controls_toward_goal(x0, x_goal)
         init_states = self._straight_line_state_guess(x0, x_goal)
@@ -281,6 +314,8 @@ class ILQRPlanner:
 
         return states, u, K_seq, init_states
 
+    # Start from the goal and work backwards to the start. Compute a quadratic approximation
+    # of the cost at each step (using those IFT gradients A and B)
     def backward_pass(self, states, u, results, x_goal, weights):
         N = self.N
         Q, R, Qf = weights['Q'], weights['R'], weights['Qf']
@@ -310,6 +345,7 @@ class ILQRPlanner:
             Vxx = Qxx + K_seq[t].T @ Quu @ K_seq[t] + K_seq[t].T @ Qux + Qux.T @ K_seq[t]
         return k_seq, K_seq
     
+    # Roll out the current sequence of controls u to get states X
     def forward_pass(self, x0, u_nom, k=None, K=None, alpha=1.0, x_old=None):
         states, results, u_applied =[np.array(x0, dtype=float, copy=True)], [],[]
 
@@ -317,15 +353,16 @@ class ILQRPlanner:
             u_t = np.array(u_nom[t], dtype=float, copy=True)
             if k is not None:
                 dx = states[-1] - x_old[t]
-                dx[2] = self._wrap_angle(dx[2]) # Prevent crazy heading leaps
+                dx[2] = self._wrap_angle(dx[2]) 
                 u_t = u_t + alpha * k[t] + K[t] @ dx
 
-            # SAFETY LIMITS: Avoid blowing up the tan() kinematics
-            # u_t[0] = np.clip(u_t[0], -5.0, 5.0)  
-            # u_t[1] = np.clip(u_t[1], -1.2, 1.2)  
-            u_applied.append(u_t)
+            # --- THE FIX ---
+            # Project the requested controls to physical limits and ONLY 
+            # save the bounded, physically applied controls for the optimizer.
+            u_t_clipped, _ = self.car.project_controls(u_t)
+            u_applied.append(u_t_clipped)
 
-            x_next, res = self.car.lower_level_physics(states[-1], u_t)
+            x_next, res = self.car.lower_level_physics(states[-1], u_t_clipped)
             states.append(np.array(x_next, dtype=float, copy=True))
             results.append((states[-1], res))
 
@@ -357,37 +394,48 @@ if __name__ == "__main__":
     goal_pose  = np.array([10.0, 5.0, 0.0])
     weights = {'Q': np.diag([10, 10, 0.5]), 
                'R': np.diag([0.1, 0.1]),
-               'Qf': np.diag([800, 800, 20])}
+               'Qf': np.diag([400, 400, 10])}
 
     planner = ILQRPlanner(car, horizon=30)
     planned_traj, u_nom, K_seq, init_traj = planner.solve(start_pose, goal_pose, weights)
 
     actual_states = [start_pose]
     x_curr = start_pose
+    u_values = []
     for t in range(len(u_nom)):
         error = x_curr - planned_traj[t]
         error[2] = planner._wrap_angle(error[2])
         
         u_feedback = u_nom[t] + K_seq[t] @ error
+
+        u_feedback_clipped, _ = car.project_controls(u_feedback)
+        u_values.append(u_feedback_clipped)
         # Constrain feedback to prevent noise from inducing singularity
         # u_feedback[0] = np.clip(u_feedback[0], -5.0, 5.0)
         # u_feedback[1] = np.clip(u_feedback[1], -1.2, 1.2)
         
-        x_next, _ = car.lower_level_physics(x_curr, u_feedback)
+        x_next, _ = car.lower_level_physics(x_curr, u_feedback_clipped)
         x_curr = x_next + np.random.normal(0, 0.04, 3) 
         actual_states.append(x_curr)
+
     actual_states = np.array(actual_states)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_xlim(-1, 12); ax.set_ylim(-1, 8); ax.set_aspect('equal')
+    fig, ax = plt.subplots(2,1,figsize=(10, 6))
+    ax[0].set_xlim(-1, 11); ax[0].set_ylim(-1, 8); #ax[0].set_aspect('equal')
 
     for o in car.obs:
-        if o['type'] == 'circle': ax.add_patch(patches.Circle((o['x'], o['y']), o['r'], color='red', alpha=0.3))
-        if o['type'] == 'wall': ax.add_patch(patches.Rectangle((o['x'], o['y']), o['w'], o['h'], color='black', alpha=0.5))
+        if o['type'] == 'circle': ax[0].add_patch(patches.Circle((o['x'], o['y']), o['r'], color='red', alpha=0.3))
+        if o['type'] == 'wall': ax[0].add_patch(patches.Rectangle((o['x'], o['y']), o['w'], o['h'], color='black', alpha=0.5))
+    ax[0].plot(init_traj[:,0], init_traj[:,1], 'r--', label='Initial Guess (Colliding)')
+    ax[0].plot(planned_traj[:,0], planned_traj[:,1], 'b-', label='iLQR Plan (IFT Aware)')
+    ax[0].plot(actual_states[:,0], actual_states[:,1], 'g.-', alpha=0.6, label='True Performance (Noisy)')
+    ax[0].scatter(goal_pose[0], goal_pose[1], marker='X', color='green', s=100, label='Goal')
 
-    ax.plot(init_traj[:,0], init_traj[:,1], 'r--', label='Initial Guess (Colliding)')
-    ax.plot(planned_traj[:,0], planned_traj[:,1], 'b-', label='iLQR Plan (IFT Aware)')
-    ax.plot(actual_states[:,0], actual_states[:,1], 'g-', alpha=0.6, label='True Performance (Noisy)')
-    ax.scatter(goal_pose[0], goal_pose[1], marker='X', color='green', s=100, label='Goal')
-
-    ax.legend(); plt.title("Physics-Based Trajectory Optimization"); plt.show()
+    ax[0].legend(); plt.title("Physics-Based Trajectory Optimization"); 
+    
+    ax[1].plot(u_values); 
+    ax[1].set_title("Applied Controls (with Feedback)"); 
+    ax[1].legend(['Velocity', 'Steering'])
+    ax[1].set_xlabel("Time Step"); ax[1].set_ylabel("Control Value")
+    
+    plt.show()
